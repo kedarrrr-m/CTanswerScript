@@ -53,6 +53,8 @@ Since this is a developer extension, you'll need to load it manually from the so
 
 ![Exported PDF showing questions, scores, and evaluator comments](docs/screenshot-pdf-output.png)
 
+![Exported PDF showing the appended answer script pages](docs/screenshot-pdf-answerscript.png)
+
 ## How it Works
 
 - **Extraction (`popup.js`)**: Injects a script into the `MAIN` world of the CodeTantra page to securely read the global `window.testSummary` object and parse the DOM for evaluator comments.
