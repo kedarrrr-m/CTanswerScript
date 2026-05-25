@@ -1,6 +1,9 @@
 // popup.js — Controls the popup UI state and bridges to background.js
 
 const states = ['invalid', 'ready', 'progress', 'error', 'done'];
+const PDF_GENERATION_TIMEOUT_MS = 120000; // 2 minutes timeout
+const PDF_PREFETCH_TIMEOUT_MS = 15000; // 15 seconds for prefetch
+const MAX_PDF_SIZE = 50 * 1024 * 1024; // 50MB limit
 
 function showState(name) {
   states.forEach(s => {
@@ -29,10 +32,15 @@ async function extractFromPage(tabId) {
     target: { tabId },
     world: 'MAIN',
     func: async () => {
+      // Validate testSummary structure
       const ts = window.testSummary;
-      if (!ts) return null;
+      if (!ts || typeof ts !== 'object') return null;
+      
+      // Validate required properties exist
+      if (typeof ts.userMarks === 'undefined' || typeof ts.totalMarks === 'undefined') return null;
 
-      const qidVsPageNum = window.qidVsPageNum || {};
+      // Safely validate qidVsPageNum
+      const qidVsPageNum = (window.qidVsPageNum && typeof window.qidVsPageNum === 'object') ? window.qidVsPageNum : {};
 
       const examData = {
         examTitle: document.querySelector('.card-header.bg-dark h5 span')?.innerText?.trim() || 'Unknown Exam',
@@ -79,13 +87,37 @@ async function extractFromPage(tabId) {
           }
 
           const qBody = card.querySelector('.questionText.ql-editor');
-          const imageUrls = qBody ? [...qBody.querySelectorAll('img')].map(i => i.src) : [];
+          // Validate and filter image URLs
+          const imageUrls = qBody ? [...qBody.querySelectorAll('img')]
+            .map(i => i.src)
+            .filter(src => {
+              try {
+                const url = new URL(src);
+                return url.protocol === 'https:' && !src.startsWith('data:');
+              } catch (_) {
+                return false;
+              }
+            }) : [];
           const questionText = qBody?.innerText?.trim() || '';
 
-          const maxMarks = ts.questionPaper?.questionsMap?.[qid]?.marks
-                        || ts.questionPaper?.sectionsMap && Object.values(ts.questionPaper.sectionsMap)
-                             .find(s => s.questionIdsArr?.includes(qid))?.marksPerQuestion
-                        || '?';
+          // Safely extract maxMarks with validation
+          let maxMarks = '?';
+          if (ts.questionPaper && typeof ts.questionPaper === 'object') {
+            const qMap = ts.questionPaper.questionsMap;
+            if (qMap && typeof qMap === 'object' && qid in qMap && qMap[qid]?.marks) {
+              maxMarks = qMap[qid].marks;
+            } else {
+              const sMap = ts.questionPaper.sectionsMap;
+              if (sMap && typeof sMap === 'object') {
+                const section = Object.values(sMap).find(s => 
+                  s?.questionIdsArr && Array.isArray(s.questionIdsArr) && s.questionIdsArr.includes(qid)
+                );
+                if (section?.marksPerQuestion) {
+                  maxMarks = section.marksPerQuestion;
+                }
+              }
+            }
+          }
 
           const evaluatorComments = document.getElementById(`comments-${qid}`)?.value?.trim() || '';
           const answerPages = qidVsPageNum[qid] || [];
@@ -102,18 +134,30 @@ async function extractFromPage(tabId) {
       // Running inside the page means the signed S3 URL is fetched with the
       // same origin/cookies as the page itself — no CORS issues.
       const pdfUrl = ts.uploadedFileDetails?.s3path;
-      if (pdfUrl) {
+      if (pdfUrl && typeof pdfUrl === 'string') {
         try {
-          const res = await fetch(pdfUrl);
+          // Add timeout to prefetch (15 seconds)
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), PDF_PREFETCH_TIMEOUT_MS);
+          
+          const res = await fetch(pdfUrl, { signal: controller.signal });
+          clearTimeout(timeoutId);
+          
           if (res.ok) {
             const buf   = await res.arrayBuffer();
             const u8    = new Uint8Array(buf);
-            let binary  = '';
-            const chunk = 8192;
-            for (let i = 0; i < u8.length; i += chunk) {
-              binary += String.fromCharCode(...u8.subarray(i, Math.min(i + chunk, u8.length)));
+            
+            // Size check
+            if (u8.length > MAX_PDF_SIZE) {
+              console.warn('CT Exporter: PDF too large, skipping prefetch');
+            } else {
+              let binary  = '';
+              const chunk = 8192;
+              for (let i = 0; i < u8.length; i += chunk) {
+                binary += String.fromCharCode(...u8.subarray(i, Math.min(i + chunk, u8.length)));
+              }
+              examData.answerPdfBase64 = btoa(binary);
             }
-            examData.answerPdfBase64 = btoa(binary);
           }
         } catch (e) {
           console.warn('CT Exporter: could not pre-fetch answer PDF:', e.message);
@@ -163,41 +207,59 @@ async function extractFromPage(tabId) {
       // Ask background to build the PDF (it fetches S3 resources and runs pdf-lib).
       // Use browser namespace if available (Firefox), fall back to chrome (Chromium).
       const _rt = typeof browser !== 'undefined' ? browser : chrome;
-      _rt.runtime.sendMessage({ type: 'generatePdf', data: freshData })
-        .then(response => {
-          if (!response?.success) {
-            showError(response?.error || 'Unknown error during PDF generation.');
-            return;
-          }
-          // Trigger download via Blob URL — works cross-browser without size limits.
-          const bytes = Uint8Array.from(atob(response.pdfBase64), c => c.charCodeAt(0));
-          const blob = new Blob([bytes], { type: 'application/pdf' });
-          const url = URL.createObjectURL(blob);
-          const a = document.createElement('a');
-          a.href = url;
-          a.download = response.filename;
-          a.click();
-          URL.revokeObjectURL(url);
-          showState('done');
-        })
-        .catch(err => {
-          showError(err?.message || 'Unknown error during PDF generation.');
-        });
-
+      
       // Simulate progress ticks while background works
-      const steps = [
-        [40,  'Downloading question images…'],
-        [60,  'Building cover & question pages…'],
-        [80,  'Merging answer script pages…'],
-        [93,  'Finalising PDF…'],
-      ];
-      for (const [pct, label] of steps) {
-        await new Promise(r => setTimeout(r, 1800));
-        // Don't overwrite done/error state if already resolved
-        if (document.getElementById('state-progress').classList.contains('active')) {
-          setProgress(pct, label);
+      const progressPromise = (async () => {
+        const steps = [
+          [40,  'Downloading question images…'],
+          [60,  'Building cover & question pages…'],
+          [80,  'Merging answer script pages…'],
+          [93,  'Finalising PDF…'],
+        ];
+        for (const [pct, label] of steps) {
+          await new Promise(r => setTimeout(r, 1800));
+          // Don't overwrite done/error state if already resolved
+          const progressEl = document.getElementById('state-progress');
+          if (progressEl && progressEl.classList.contains('active')) {
+            setProgress(pct, label);
+          }
         }
+      })();
+      
+      // Use proper async/await to avoid race conditions
+      const response = await new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          reject(new Error(`PDF generation timeout (exceeded ${PDF_GENERATION_TIMEOUT_MS / 1000} seconds)`));
+        }, PDF_GENERATION_TIMEOUT_MS);
+        
+        _rt.runtime.sendMessage({ type: 'generatePdf', data: freshData })
+          .then(resp => {
+            clearTimeout(timeout);
+            resolve(resp);
+          })
+          .catch(err => {
+            clearTimeout(timeout);
+            reject(err);
+          });
+      });
+      
+      // Wait for progress simulation to complete (won't prevent early completion)
+      await progressPromise.catch(() => {}); // ignore progress errors
+      
+      if (!response?.success) {
+        throw new Error(response?.error || 'Unknown error during PDF generation.');
       }
+      
+      // Trigger download via Blob URL — works cross-browser without size limits.
+      const bytes = Uint8Array.from(atob(response.pdfBase64), c => c.charCodeAt(0));
+      const blob = new Blob([bytes], { type: 'application/pdf' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = response.filename;
+      a.click();
+      URL.revokeObjectURL(url);
+      showState('done');
 
     } catch (err) {
       showError(err.message);

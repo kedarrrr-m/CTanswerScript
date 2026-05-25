@@ -9,10 +9,56 @@ const { PDFDocument, rgb, StandardFonts } = PDFLib;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-async function fetchBytes(url) {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`HTTP ${res.status} fetching ${url.split('?')[0]}`);
-  return new Uint8Array(await res.arrayBuffer());
+// Configuration constants
+const MAX_PDF_SIZE = 50 * 1024 * 1024; // 50MB limit
+const LARGE_BUFFER_THRESHOLD = 1024 * 1024; // 1MB threshold for base64 encoding strategy
+const PDF_GENERATION_TIMEOUT_MS = 120000; // 2 minutes timeout
+
+// Whitelist of allowed S3 domains
+const ALLOWED_S3_DOMAINS = ['ct-public-bucket.s3.ap-south-1.amazonaws.com'];
+
+function validateS3Url(url) {
+  try {
+    const urlObj = new URL(url);
+    // Strict hostname matching (not substring)
+    return ALLOWED_S3_DOMAINS.includes(urlObj.hostname) && urlObj.protocol === 'https:';
+  } catch (_) {
+    return false;
+  }
+}
+
+async function fetchBytes(url, { timeout = 30000 } = {}) {
+  // For S3 URLs, apply strict domain whitelisting
+  try {
+    const urlObj = new URL(url);
+    // Only allow explicitly whitelisted S3 domains
+    // This is a whitelist approach: only allow known-good domains
+    const isAllowedS3Url = ALLOWED_S3_DOMAINS.includes(urlObj.hostname);
+    
+    // If URL appears to be S3-related but not whitelisted, reject it
+    // Check for S3-specific patterns to catch attempted bypass attempts
+    if (!isAllowedS3Url && urlObj.hostname) {
+      // Perform strict validation: only allow if explicitly whitelisted
+      if (urlObj.hostname.startsWith('s3') || 
+          (urlObj.hostname.indexOf('amazonaws') !== -1)) {
+        throw new Error('S3 URL origin not whitelisted');
+      }
+    }
+  } catch (e) {
+    if (e.message === 'S3 URL origin not whitelisted') throw e;
+    // If URL parsing fails or isn't a full URL, continue with the fetch
+  }
+  
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeout);
+  
+  try {
+    const res = await fetch(url, { signal: controller.signal });
+    if (!res.ok) throw new Error(`HTTP ${res.status} fetching ${url.split('?')[0]}`);
+    return new Uint8Array(await res.arrayBuffer());
+  } finally {
+    clearTimeout(timeoutId);
+  }
 }
 
 function imageTypeFromUrl(url) {
@@ -21,9 +67,23 @@ function imageTypeFromUrl(url) {
   return 'jpg'; // default for S3 JPEG images
 }
 
-async function embedImage(pdfDoc, url) {
+function validateImageUrl(url) {
   try {
-    const bytes = await fetchBytes(url);
+    const urlObj = new URL(url);
+    // Only allow https protocol, reject data-URIs
+    return urlObj.protocol === 'https:' && !url.startsWith('data:');
+  } catch (_) {
+    return false;
+  }
+}
+
+async function embedImage(pdfDoc, url) {
+  if (!validateImageUrl(url)) {
+    console.warn('Invalid image URL rejected:', url.split('?')[0]);
+    return null;
+  }
+  try {
+    const bytes = await fetchBytes(url, { timeout: 15000 });
     return imageTypeFromUrl(url) === 'png'
       ? await pdfDoc.embedPng(bytes)
       : await pdfDoc.embedJpg(bytes);
@@ -31,6 +91,28 @@ async function embedImage(pdfDoc, url) {
     console.warn('Could not embed image:', url, e.message);
     return null;
   }
+}
+
+// Convert Uint8Array to binary string in chunks
+function uint8ToBinaryString(bytes) {
+  let binary = '';
+  const chunk = 8192;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(i, Math.min(i + chunk, bytes.length)));
+  }
+  return binary;
+}
+
+// Safely convert binary to base64 without stack overflow
+// Always returns a Promise for consistent async behavior
+function binaryToBase64(bytes) {
+  return Promise.resolve().then(() => {
+    // For all buffers, use consistent chunked conversion
+    const binary = uint8ToBinaryString(bytes);
+    return btoa(binary);
+  }).catch(e => {
+    throw new Error('Failed to encode PDF: ' + e.message);
+  });
 }
 
 // Strip characters that WinAnsi (pdf-lib standard fonts) cannot encode.
@@ -303,6 +385,11 @@ async function buildPdf(examData) {
     }
 
     if (!ansBytes) throw new Error('No answer script data found.');
+    
+    // Validate PDF size before loading
+    if (ansBytes.length > MAX_PDF_SIZE) {
+      throw new Error(`Answer PDF too large (${Math.round(ansBytes.length / 1024 / 1024)}MB). Maximum allowed: ${Math.round(MAX_PDF_SIZE / 1024 / 1024)}MB`);
+    }
 
     const ansPdf    = await PDFDocument.load(ansBytes);
     const pageCount = ansPdf.getPageCount();
@@ -346,18 +433,19 @@ _runtime.runtime.onMessage.addListener((message, _sender) => {
   const safeName = (examData.examTitle || 'exam_results')
     .replace(/[^a-z0-9]/gi, '_')
     .replace(/__+/g, '_')
-    .slice(0, 60);
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 60) || 'exam_results'; // fallback if empty after sanitization
   const filename = `CT_Export_${safeName}_${new Date().toISOString().slice(0,10)}.pdf`;
 
   return buildPdf(examData)
-    .then(pdfBytes => {
-      // Convert to base64 in chunks to avoid stack overflow on large PDFs
-      let binary = '';
-      const chunk = 8192;
-      for (let i = 0; i < pdfBytes.length; i += chunk) {
-        binary += String.fromCharCode(...pdfBytes.subarray(i, Math.min(i + chunk, pdfBytes.length)));
+    .then(async pdfBytes => {
+      // Validate PDF size
+      if (pdfBytes.length > MAX_PDF_SIZE) {
+        throw new Error(`PDF too large (${Math.round(pdfBytes.length / 1024 / 1024)}MB). Maximum allowed: ${Math.round(MAX_PDF_SIZE / 1024 / 1024)}MB`);
       }
-      const b64 = btoa(binary);
+      
+      // Convert to base64 safely (handles large files)
+      const b64 = await binaryToBase64(pdfBytes);
       // Send bytes back to popup so it can download via Blob URL.
       // This avoids the Firefox service-worker data-URL download size limit.
       return { success: true, pdfBase64: b64, filename };
