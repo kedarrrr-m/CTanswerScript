@@ -8,6 +8,8 @@ It takes the scattered data on the CodeTantra results page—including your subm
 
 - **One-Click Export**: Extracts exam data directly from the page context without requiring manual copying or screenshots.
 - **Smart Formatting**: Compiles questions, images, and evaluator comments into a dense, continuously flowing layout to minimize wasted space. 
+- **Marks Breakdown**: Includes the rubric table from "Show marks break down" for each question (criteria, marks awarded, and evaluator comment per criterion).
+- **Sub-parts & Math**: Keeps the question's paragraph structure, lists sub-parts such as `P1)`, `(a)` or `(ii)` as indented items, and exports MathJax formulas as their LaTeX source (`$...$`).
 - **Answer Script Merging**: Automatically appends your originally uploaded answer script PDF to the end of the document.
 - **LLM-Ready**: Designed specifically to create a unified PDF that can be attached to ChatGPT, Claude, or Gemini for easy analysis of your performance and mistakes.
 - **S3 Pre-fetching**: Bypasses CORS restrictions by downloading answer script resources from AWS S3 using the page's native browser context.
